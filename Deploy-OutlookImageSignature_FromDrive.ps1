@@ -6,16 +6,18 @@
 
 .CHANGELOG
   2025-09-23: Replaced System.Net.Http client with Invoke-WebRequest + cookie session (PS 5.1).
-  2025-09-23: Added support to match inner ZIP file names by SAM (domain format: first initial + last name).
-  2025-09-23: Added matching for FirstnameLastname.* based on DisplayName (e.g., 'Kesha Blevins' -> 'KeshaBlevins.jpg').
+  2025-09-23: Added support to match inner ZIP file names by SAM (first initial + last name).
+  2025-09-23: Added fallback to match FirstnameLastname.* using SAM-derived initial+lastname (e.g., kblevins → ^K[a-z]+Blevins\.(jpg|jpeg|png)$).
+  2025-09-23: Fixed TitleCase helper to use System.Globalization.CultureInfo.
 
 .DESCRIPTION
   Handles two packaging styles:
    A) Single ZIP that contains all users' images (flat or in subfolders).
    B) Single ZIP that contains many per-user ZIPs (e.g., jbean.zip, KeshaBlevins.zip), each with that user's images.
-  The script will pick the correct per-user asset by matching:
-     Preferred: -ImagePattern (UPN | SAM | DisplayName)
-     Fallbacks: the other keys and derived variants, including FirstnameLastname collapsed.
+  Matching order:
+     Preferred: -ImagePattern value (UPN | SAM | DisplayName)
+     Fallbacks: other keys + derived FirstLastCompact/FullCompact
+     Final fallback: regex from SAM initial+lastname to find FirstnameLastname.* files
   File types supported: .jpg, .jpeg, .png
 
 .PARAMETER GoogleDriveFileId
@@ -31,12 +33,12 @@
 .PARAMETER ForceKillOutlook
   Close Outlook if running so the signature is picked up immediately.
 
-.EXAMPLE
-  .\Deploy-OutlookImageSignature_FromDrive.ps1 -GoogleDriveFileId "1yg6cqUoLf1Zw5LdjNf59NCeyEJZgOmXo" -SignatureName "Company-Standard" -ImagePattern SAM -ForceKillOutlook
-
 .NOTES
   - Works for classic Outlook (Office 16.0). The new Outlook (Monarch) does not use local signatures.
   - Ensure devices can reach Google Drive download endpoints.
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -NoProfile -File .\Deploy-OutlookImageSignature_FromDrive.ps1 -GoogleDriveFileId "1yg6cqUoLf1Zw5LdjNf59NCeyEJZgOmXo" -SignatureName "Company-Standard" -ImagePattern SAM -ForceKillOutlook
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -63,28 +65,24 @@ function Ensure-Tls12 {
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
   } catch {
-    try {
-      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    } catch {}
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
   }
 }
 
 function To-TitleCase([string]$s) {
   if ([string]::IsNullOrWhiteSpace($s)) { return $null }
   $s = $s.ToLower()
-  return ([CultureInfo]::InvariantCulture).TextInfo.ToTitleCase($s)
+  return ([System.Globalization.CultureInfo]::InvariantCulture).TextInfo.ToTitleCase($s)
 }
 
 function Get-UserContext {
-  # Build a rich context: UPN, SAM, DisplayName, plus name-derived variants like FirstLastCollapsed.
+  # Build UPN, SAM, DisplayName + name-derived variants like FirstLastCollapsed.
   $upn = $null
   try {
     $upn = (whoami /upn) 2>$null
     if ([string]::IsNullOrWhiteSpace($upn)) { $upn = $null }
   } catch {}
-  if (-not $upn -and $env:USERDNSDOMAIN) {
-    $upn = "$($env:USERNAME)@$($env:USERDNSDOMAIN)"
-  }
+  if (-not $upn -and $env:USERDNSDOMAIN) { $upn = "$($env:USERNAME)@$($env:USERDNSDOMAIN)" }
 
   $sam = $env:USERNAME
 
@@ -111,7 +109,6 @@ function Get-UserContext {
       $first = To-TitleCase $tokens[0]
       $last  = To-TitleCase $tokens[-1]
       $firstLastCompact = "$first$last"
-      # Also a compact of all tokens, e.g., "KeshaMarieBlevins"
       $fullCompact = ($tokens | ForEach-Object { To-TitleCase $_ }) -join ''
     } elseif ($tokens.Count -eq 1) {
       $fullCompact = To-TitleCase $tokens[0]
@@ -188,10 +185,7 @@ function Expand-ZipToTemp {
 }
 
 function Expand-ZipFile {
-  param(
-    [string]$ZipPath,
-    [string]$TargetFolder
-  )
+  param([string]$ZipPath,[string]$TargetFolder)
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $TargetFolder)
 }
@@ -202,39 +196,65 @@ function Get-FallbackKeyOrder {
   @($Preferred) + ($all | Where-Object { $_ -ne $Preferred }) | Select-Object -Unique
 }
 
-function Try-FindInnerUserZip {
+function Get-InitialLastFromSam {
+  param([string]$Sam)
+  if ([string]::IsNullOrWhiteSpace($Sam) -or $Sam.Length -lt 2) { return $null }
+  $s = ($Sam -replace "[^A-Za-z]","")  # letters only
+  if ($s.Length -lt 2) { return $null }
+  $initial = $s.Substring(0,1)
+  $lastLower = $s.Substring(1).ToLower()
+  [pscustomobject]@{ Initial = $initial; LastLower = $lastLower }
+}
+
+function Find-ByInitialLastRegex {
   param(
     [string]$Folder,
-    [pscustomobject]$Ctx,
-    [string]$PreferredPattern
+    [string]$Initial,
+    [string]$LastLower,
+    [string[]]$Extensions,
+    [switch]$ZipMode
   )
-
-  $order = Get-FallbackKeyOrder -Preferred $PreferredPattern
-  $zips = Get-ChildItem -LiteralPath $Folder -Recurse -File -Include *.zip -ErrorAction SilentlyContinue
-
-  foreach ($key in $order) {
-    $name = $Ctx.$key
-    if (-not $name) { continue }
-    $cands = @(
-      ($name + ".zip"),
-      ($name.ToLower() + ".zip")
-    )
-    foreach ($z in $zips) {
-      if ($cands -contains $z.Name) { return $z.FullName }
+  # Build regex: ^(?i)K[a-z]+blevins$
+  $rx = "^(?i)" + [regex]::Escape($Initial) + "[a-z]+" + [regex]::Escape($LastLower) + "$"
+  $files = Get-ChildItem -LiteralPath $Folder -Recurse -File -ErrorAction SilentlyContinue
+  foreach ($f in $files) {
+    if ($ZipMode) {
+      if ($f.Extension -ieq ".zip" -and ($f.BaseName -match $rx)) { return $f.FullName }
+    } else {
+      if ($Extensions -icontains $f.Extension -and ($f.BaseName -match $rx)) { return $f.FullName }
     }
   }
   return $null
 }
 
+function Try-FindInnerUserZip {
+  param([string]$Folder,[pscustomobject]$Ctx,[string]$PreferredPattern)
+  $order = Get-FallbackKeyOrder -Preferred $PreferredPattern
+
+  # Exact name matches first
+  $zips = Get-ChildItem -LiteralPath $Folder -Recurse -File -Include *.zip -ErrorAction SilentlyContinue
+  foreach ($key in $order) {
+    $name = $Ctx.$key
+    if (-not $name) { continue }
+    $cands = @(($name + ".zip"), ($name.ToLower() + ".zip"))
+    foreach ($z in $zips) { if ($cands -contains $z.Name) { return $z.FullName } }
+  }
+
+  # Fallback: SAM initial + lastname → FirstnameLastname.zip
+  $samParts = Get-InitialLastFromSam -Sam $Ctx.SAM
+  if ($samParts) {
+    $zipGuess = Find-ByInitialLastRegex -Folder $Folder -Initial $samParts.Initial -LastLower $samParts.LastLower -Extensions @() -ZipMode
+    if ($zipGuess) { return $zipGuess }
+  }
+  return $null
+}
+
 function Find-UserImageInFolder {
-  param(
-    [string]$Folder,
-    [pscustomobject]$Ctx,
-    [string]$PreferredPattern # UPN/SAM/DisplayName/FirstLastCompact/FullCompact
-  )
+  param([string]$Folder,[pscustomobject]$Ctx,[string]$PreferredPattern)
   $extensions = @(".jpg",".jpeg",".png")
   $order = Get-FallbackKeyOrder -Preferred $PreferredPattern
 
+  # Direct file-name matches
   foreach ($key in $order) {
     foreach ($ext in $extensions) {
       $name = $Ctx.$key
@@ -243,10 +263,7 @@ function Find-UserImageInFolder {
           (Join-Path $Folder ($name + $ext)),
           (Join-Path $Folder ($name.ToLower() + $ext))
         )
-        foreach ($p in $candidates) {
-          if (Test-Path -LiteralPath $p) { return $p }
-        }
-        # recursive search (in case of subfolders)
+        foreach ($p in $candidates) { if (Test-Path -LiteralPath $p) { return $p } }
         $found = Get-ChildItem -LiteralPath $Folder -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
           $_.Name -ieq ($name + $ext)
         } | Select-Object -First 1
@@ -254,15 +271,21 @@ function Find-UserImageInFolder {
       }
     }
   }
+
+  # Fuzzy fallback: SAM initial + lastname → FirstnameLastname.ext
+  $samParts = Get-InitialLastFromSam -Sam $Ctx.SAM
+  if ($samParts) {
+    $fuzzy = Find-ByInitialLastRegex -Folder $Folder -Initial $samParts.Initial -LastLower $samParts.LastLower -Extensions $extensions
+    if ($fuzzy) {
+      Write-Log "Fuzzy match via SAM → FirstnameLastname: $([IO.Path]::GetFileName($fuzzy))"
+      return $fuzzy
+    }
+  }
   return $null
 }
 
 function New-HtmlSignature {
-  param(
-    [string]$SigFolder,
-    [string]$SigBaseName,
-    [string]$ImageFile
-  )
+  param([string]$SigFolder,[string]$SigBaseName,[string]$ImageFile)
   $htmlPath = Join-Path $SigFolder ($SigBaseName + ".htm")
   $rtfPath  = Join-Path $SigFolder ($SigBaseName + ".rtf")
   $txtPath  = Join-Path $SigFolder ($SigBaseName + ".txt")
@@ -332,16 +355,12 @@ try {
 
   # 4) Find image for current user within the chosen folder
   $srcImage = Find-UserImageInFolder -Folder $searchRoot -Ctx $ctx -PreferredPattern $ImagePattern
-  if (-not $srcImage) {
-    throw "Could not locate an image for user using UPN/SAM/DisplayName/FirstLastCompact/FullCompact (.jpg/.jpeg/.png)."
-  }
+  if (-not $srcImage) { throw "Could not locate an image for user using UPN/SAM/DisplayName/FirstLastCompact/FullCompact (.jpg/.jpeg/.png)." }
   Write-Log "Matched user image: $srcImage"
 
   # 5) Ensure Outlook signature directory exists
   $sigFolder = Join-Path $env:APPDATA "Microsoft\Signatures"
-  if (-not (Test-Path $sigFolder)) {
-    New-Item -Path $sigFolder -ItemType Directory -Force | Out-Null
-  }
+  if (-not (Test-Path $sigFolder)) { New-Item -Path $sigFolder -ItemType Directory -Force | Out-Null }
 
   # 6) Copy the image into Signatures and create signature HTML
   $targetImage = Join-Path $sigFolder ([IO.Path]::GetFileName($srcImage))
@@ -372,7 +391,6 @@ catch {
   exit 1
 }
 finally {
-  # Clean up temp files/folders
   try {
     if (Test-Path $tempZip) { Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue }
     if ($extractFolder -and (Test-Path $extractFolder)) { Remove-Item -LiteralPath $extractFolder -Recurse -Force -ErrorAction SilentlyContinue }
