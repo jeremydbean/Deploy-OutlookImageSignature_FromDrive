@@ -1,10 +1,11 @@
-# Create updated script that adds an interactive 1/2/3 selection menu when no image is auto-matched.
+# Write a fully fixed PowerShell script (PS 5.1), clean ASCII, correct #requires newline,
+# proper string quoting (so '&' is inside quotes), + manual overrides + interactive menu fallback.
 script = r"""#requires -Version 5.1
 <#
 .SYNOPSIS
   Download a ZIP (or per-user ZIPs) from Google Drive, locate the correct JPG/PNG for the current user,
   and deploy it as the default Outlook signature (classic Outlook). If no auto-match is found, the script
-  will prompt the user with a numbered list of all images found in the ZIP (and inner per-user ZIPs) to choose from.
+  will prompt the user with a numbered list of all images found to choose from.
 
 .CHANGELOG
   2025-09-23: PS 5.1-only networking (Invoke-WebRequest + cookies) for Google Drive.
@@ -12,8 +13,8 @@ script = r"""#requires -Version 5.1
   2025-09-23: Added inner per-user ZIP support.
   2025-09-23: Stream the target image directly from the ZIP (no massive temp extraction).
   2025-09-24: Manual overrides for 'pibrodie' → 'PierreBrodie' and 'pbrodie' → 'PatriciaBrodie'.
-  2025-09-24: PS 5.1 compatibility (removed ternary operator).
-  2025-09-24: NEW: Interactive fallback menu (1., 2., 3., …) to select image when auto-match fails.
+  2025-09-24: PS 5.1 compatibility (no ternary operator).
+  2025-09-24: Interactive fallback menu (1., 2., 3., …) to select image when auto-match fails.
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -265,15 +266,12 @@ function Find-ImageFromZip {
 }
 
 function Prompt-SelectImageFromZip {
-  param(
-    [string]$ZipPath
-  )
+  param([string]$ZipPath)
   Add-ZipAssemblies
   $exts = @(".jpg",".jpeg",".png")
 
   $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
   try {
-    # collect candidates from outer zip
     $candidates = New-Object System.Collections.Generic.List[object]
     $index = 1
 
@@ -288,7 +286,6 @@ function Prompt-SelectImageFromZip {
       }
     }
 
-    # collect candidates from inner per-user zips
     foreach ($outer in $zip.Entries) {
       if ($outer.Length -eq 0) { continue }
       if ([IO.Path]::GetExtension($outer.Name) -ieq ".zip") {
@@ -319,7 +316,6 @@ function Prompt-SelectImageFromZip {
       return $null
     }
 
-    # prompt
     $sel = $null
     while ($true) {
       $ans = Read-Host "No auto-match found. Enter the number of the correct image (1-$($candidates.Count))"
@@ -333,7 +329,6 @@ function Prompt-SelectImageFromZip {
     if ($choice.Type -eq "Outer") {
       return Extract-EntryToTemp -Entry $choice.Entry -Ext $choice.Ext
     } else {
-      # re-open the inner zip and extract the named entry
       $ms2 = New-Object IO.MemoryStream
       $s2 = $choice.Outer.Open()
       try { $s2.CopyTo($ms2) } finally { $s2.Dispose() }
@@ -455,7 +450,7 @@ finally {
 }
 #endregion Main
 """
-path = "/mnt/data/Deploy-OutlookImageSignature_FromDrive.ps1"
+path = "/mnt/data/Deploy-OutlookImageSignature_FromDrive_FIXED.ps1"
 with open(path, "w", encoding="utf-8") as f:
     f.write(script)
-path
+print(path)
