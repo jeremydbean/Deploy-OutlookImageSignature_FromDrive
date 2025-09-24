@@ -1,6 +1,4 @@
-# Write a fully fixed PowerShell script (PS 5.1), clean ASCII, correct #requires newline,
-# proper string quoting (so '&' is inside quotes), + manual overrides + interactive menu fallback.
-script = r"""#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
   Download a ZIP (or per-user ZIPs) from Google Drive, locate the correct JPG/PNG for the current user,
@@ -449,8 +447,3 @@ finally {
   } catch {}
 }
 #endregion Main
-"""
-path = "/mnt/data/Deploy-OutlookImageSignature_FromDrive_FIXED.ps1"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(script)
-print(path)
