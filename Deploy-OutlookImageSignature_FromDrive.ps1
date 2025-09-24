@@ -1,16 +1,19 @@
-#requires -Version 5.1
+# Create updated script that adds an interactive 1/2/3 selection menu when no image is auto-matched.
+script = r"""#requires -Version 5.1
 <#
 .SYNOPSIS
-  Download a ZIP (or per-user ZIPs) from Google Drive, locate the correct JPG/PNG for the current user
-  WITHOUT fully extracting huge archives, and deploy it as the default Outlook signature (classic Outlook).
+  Download a ZIP (or per-user ZIPs) from Google Drive, locate the correct JPG/PNG for the current user,
+  and deploy it as the default Outlook signature (classic Outlook). If no auto-match is found, the script
+  will prompt the user with a numbered list of all images found in the ZIP (and inner per-user ZIPs) to choose from.
 
 .CHANGELOG
   2025-09-23: PS 5.1-only networking (Invoke-WebRequest + cookies) for Google Drive.
   2025-09-23: Added SAM→FirstnameLastname fuzzy match.
   2025-09-23: Added inner per-user ZIP support.
-  2025-09-23: Fast path — stream the target image directly from the ZIP (no massive temp extraction).
+  2025-09-23: Stream the target image directly from the ZIP (no massive temp extraction).
   2025-09-24: Manual overrides for 'pibrodie' → 'PierreBrodie' and 'pbrodie' → 'PatriciaBrodie'.
-  2025-09-24: PowerShell 5.1 compatibility (removed ternary operator).
+  2025-09-24: PS 5.1 compatibility (removed ternary operator).
+  2025-09-24: NEW: Interactive fallback menu (1., 2., 3., …) to select image when auto-match fails.
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -255,113 +258,96 @@ function Find-ImageFromZip {
         }
       }
     }
-
-    if ($manual.Count -gt 0) {
-      foreach ($e in $zip.Entries) {
-        if ($e.Length -eq 0) { continue }
-        if ([IO.Path]::GetExtension($e.Name) -ieq ".zip") {
-          $base = [IO.Path]::GetFileNameWithoutExtension($e.Name)
-          if ($manual -icontains $base) {
-            $candidate = Find-ImageInsideInnerZip -OuterEntry $e -Ctx $Ctx -Order $order -Manual $manual
-            if ($candidate) { return $candidate }
-          }
-        }
-      }
-    }
-
-    foreach ($key in $order) {
-      $name = $Ctx.$key
-      if ([string]::IsNullOrWhiteSpace($name)) { continue }
-      foreach ($e in $zip.Entries) {
-        if ($e.Length -eq 0) { continue }
-        if ([IO.Path]::GetExtension($e.Name) -ieq ".zip") {
-          $base = [IO.Path]::GetFileNameWithoutExtension($e.Name)
-          if ($base -ieq $name -or $base -ieq $name.ToLower()) {
-            $candidate = Find-ImageInsideInnerZip -OuterEntry $e -Ctx $Ctx -Order $order -Manual $manual
-            if ($candidate) { return $candidate }
-          }
-        }
-      }
-    }
-
-    if ($parts) {
-      $zrx = New-RegexFromInitialLast -Initial $parts.Initial -LastLower $parts.LastLower -ZipMode
-      foreach ($e in $zip.Entries) {
-        if ($e.Length -eq 0) { continue }
-        if ([IO.Path]::GetExtension($e.Name) -ieq ".zip") {
-          $name = [IO.Path]::GetFileName($e.Name)
-          if ($name -match $zrx) {
-            $candidate = Find-ImageInsideInnerZip -OuterEntry $e -Ctx $Ctx -Order $order -Manual $manual
-            if ($candidate) { return $candidate }
-          }
-        }
-      }
-    }
   }
   finally { $zip.Dispose() }
 
   return $null
 }
 
-function Find-ImageInsideInnerZip {
+function Prompt-SelectImageFromZip {
   param(
-    [System.IO.Compression.ZipArchiveEntry]$OuterEntry,
-    [pscustomobject]$Ctx,
-    [string[]]$Order,
-    [string[]]$Manual
+    [string]$ZipPath
   )
   Add-ZipAssemblies
   $exts = @(".jpg",".jpeg",".png")
 
-  $ms = New-Object IO.MemoryStream
-  $s = $OuterEntry.Open()
-  try { $s.CopyTo($ms) } finally { $s.Dispose() }
-  $ms.Position = 0
-
-  $inner = New-Object System.IO.Compression.ZipArchive($ms,[System.IO.Compression.ZipArchiveMode]::Read,$false)
+  $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
   try {
-    if ($Manual -and $Manual.Count -gt 0) {
-      foreach ($e in $inner.Entries) {
-        if ($e.Length -eq 0) { continue }
-        $base = [IO.Path]::GetFileNameWithoutExtension($e.Name)
-        $ext  = [IO.Path]::GetExtension($e.Name)
-        if ($exts -icontains $ext -and ($Manual -icontains $base)) {
-          Write-Log "Manual override matched inner '$($e.FullName)'."
-          return Extract-EntryToTemp -Entry $e -Ext $ext
-        }
+    # collect candidates from outer zip
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $index = 1
+
+    foreach ($e in $zip.Entries) {
+      if ($e.Length -eq 0) { continue }
+      $ext = [IO.Path]::GetExtension($e.Name)
+      if ($exts -icontains $ext) {
+        $display = $e.FullName
+        Write-Host ("  {0}. {1}" -f $index, $display)
+        $candidates.Add([pscustomobject]@{ Type="Outer"; Entry=$e; Ext=$ext })
+        $index++
       }
     }
 
-    foreach ($key in $Order) {
-      $name = $Ctx.$key
-      if ([string]::IsNullOrWhiteSpace($name)) { continue }
-      foreach ($e in $inner.Entries) {
-        if ($e.Length -eq 0) { continue }
-        $base = [IO.Path]::GetFileNameWithoutExtension($e.Name)
-        $ext  = [IO.Path]::GetExtension($e.Name)
-        if ($exts -icontains $ext -and ($base -ieq $name -or $base -ieq $name.ToLower())) {
-          Write-Log "Matched inner '$($e.FullName)' by key '$key'."
-          return Extract-EntryToTemp -Entry $e -Ext $ext
+    # collect candidates from inner per-user zips
+    foreach ($outer in $zip.Entries) {
+      if ($outer.Length -eq 0) { continue }
+      if ([IO.Path]::GetExtension($outer.Name) -ieq ".zip") {
+        $ms = New-Object IO.MemoryStream
+        $s = $outer.Open()
+        try { $s.CopyTo($ms) } finally { $s.Dispose() }
+        $ms.Position = 0
+
+        $inner = New-Object System.IO.Compression.ZipArchive($ms,[System.IO.Compression.ZipArchiveMode]::Read,$false)
+        try {
+          foreach ($ie in $inner.Entries) {
+            if ($ie.Length -eq 0) { continue }
+            $ext = [IO.Path]::GetExtension($ie.Name)
+            if ($exts -icontains $ext) {
+              $display = ("{0} -> {1}" -f $outer.Name, $ie.FullName)
+              Write-Host ("  {0}. {1}" -f $index, $display)
+              $candidates.Add([pscustomobject]@{ Type="Inner"; Outer=$outer; InnerName=$ie.FullName; Ext=$ext })
+              $index++
+            }
+          }
         }
+        finally { $inner.Dispose(); $ms.Dispose() }
       }
     }
 
-    $parts = Get-InitialLastFromSam -Sam $Ctx.SAM
-    if ($parts) {
-      $rx = New-RegexFromInitialLast -Initial $parts.Initial -LastLower $parts.LastLower
-      foreach ($e in $inner.Entries) {
-        if ($e.Length -eq 0) { continue }
-        $base = [IO.Path]::GetFileName($e.Name)
-        if ($base -match $rx) {
-          $ext  = [IO.Path]::GetExtension($base)
-          Write-Log "Fuzzy matched inner '$($e.FullName)' via '$rx'."
-          return Extract-EntryToTemp -Entry $e -Ext $ext
-        }
+    if ($candidates.Count -eq 0) {
+      Write-Log "No images (.jpg/.jpeg/.png) found anywhere in the ZIP." "ERROR"
+      return $null
+    }
+
+    # prompt
+    $sel = $null
+    while ($true) {
+      $ans = Read-Host "No auto-match found. Enter the number of the correct image (1-$($candidates.Count))"
+      if ([int]::TryParse($ans, [ref]$sel)) {
+        if ($sel -ge 1 -and $sel -le $candidates.Count) { break }
       }
+      Write-Host "Please enter a valid number between 1 and $($candidates.Count)."
+    }
+
+    $choice = $candidates[$sel-1]
+    if ($choice.Type -eq "Outer") {
+      return Extract-EntryToTemp -Entry $choice.Entry -Ext $choice.Ext
+    } else {
+      # re-open the inner zip and extract the named entry
+      $ms2 = New-Object IO.MemoryStream
+      $s2 = $choice.Outer.Open()
+      try { $s2.CopyTo($ms2) } finally { $s2.Dispose() }
+      $ms2.Position = 0
+      $inner2 = New-Object System.IO.Compression.ZipArchive($ms2,[System.IO.Compression.ZipArchiveMode]::Read,$false)
+      try {
+        $target = $inner2.GetEntry($choice.InnerName)
+        if (-not $target) { throw "Chosen inner entry not found on re-open." }
+        return Extract-EntryToTemp -Entry $target -Ext $choice.Ext
+      }
+      finally { $inner2.Dispose(); $ms2.Dispose() }
     }
   }
-  finally { $inner.Dispose(); $ms.Dispose() }
-  return $null
+  finally { $zip.Dispose() }
 }
 
 function New-HtmlSignature {
@@ -423,9 +409,13 @@ try {
 
   $imgTemp = Find-ImageFromZip -ZipPath $tempZip -Ctx $ctx -PreferredPattern $ImagePattern
   if (-not $imgTemp) {
-    throw "Could not locate an image for user using UPN/SAM/DisplayName/FirstLastCompact/FullCompact (.jpg/.jpeg/.png)."
+    Write-Log "No automatic match found. Listing available images for manual selection..." "WARN"
+    $imgTemp = Prompt-SelectImageFromZip -ZipPath $tempZip
   }
-  Write-Log "Staged image: $imgTemp"
+  if (-not $imgTemp) {
+    throw "No image selected; aborting."
+  }
+  Write-Log "Chosen image staged: $imgTemp"
 
   $sigFolder = Join-Path $env:APPDATA "Microsoft\Signatures"
   if (-not (Test-Path $sigFolder)) {
@@ -464,3 +454,8 @@ finally {
   } catch {}
 }
 #endregion Main
+"""
+path = "/mnt/data/Deploy-OutlookImageSignature_FromDrive.ps1"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(script)
+path
