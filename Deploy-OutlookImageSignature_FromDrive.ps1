@@ -6,26 +6,11 @@
 
 .CHANGELOG
   2025-09-23: PS 5.1-only networking (Invoke-WebRequest + cookies) for Google Drive.
-  2025-09-23: Added SAM→FirstnameLastname fuzzy match (e.g., kblevins → ^K[a-z]+Blevins\.(jpg|jpeg|png)$).
-  2025-09-23: Added inner per-user ZIP support (e.g., KeshaBlevins.zip).
+  2025-09-23: Added SAM→FirstnameLastname fuzzy match.
+  2025-09-23: Added inner per-user ZIP support.
   2025-09-23: Fast path — stream the target image directly from the ZIP (no massive temp extraction).
-  2025-09-24: Manual overrides: 'pibrodie' → 'PierreBrodie'; 'pbrodie' → 'PatriciaBrodie' (outer images and inner zips).
-
-.NOTES
-  - Classic Outlook only. New Outlook (Monarch) ignores local signatures.
-  - Run as the signed-in user (HKCU + %APPDATA%).
-
-.PARAMETER GoogleDriveFileId
-  Drive file ID of the ZIP to download.
-
-.PARAMETER SignatureName
-  Name of the signature to create/update in Outlook (default: Company-Standard).
-
-.PARAMETER ImagePattern
-  Which naming pattern to try first: UPN | SAM | DisplayName (default: SAM).
-
-.PARAMETER ForceKillOutlook
-  If set, closes Outlook to pick up the new signature immediately.
+  2025-09-24: Manual overrides for 'pibrodie' → 'PierreBrodie' and 'pbrodie' → 'PatriciaBrodie'.
+  2025-09-24: PowerShell 5.1 compatibility (removed ternary operator).
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -87,7 +72,6 @@ function Get-UserContext {
     if ($upn -and $upn.Contains("@")) { $displayName = $upn.Split("@")[0] } else { $displayName = $sam }
   }
 
-  # Derive compact variants from DisplayName (e.g., "Kesha Blevins" -> "KeshaBlevins")
   $firstLastCompact = $null
   $fullCompact = $null
   try {
@@ -120,12 +104,10 @@ function Invoke-GDriveDownload {
   Ensure-Tls12
   $base = "https://drive.google.com/uc?export=download&id=$FileId"
 
-  # Stage 1: initial request (capture cookies and maybe token)
   $resp1 = Invoke-WebRequest -Uri $base -UseBasicParsing -SessionVariable gdsess -Headers @{
     "User-Agent"="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
   } -ErrorAction Stop
 
-  # If Content-Disposition exists, download directly
   if ($resp1.Headers["Content-Disposition"]) {
     Invoke-WebRequest -Uri $base -OutFile $DestinationPath -UseBasicParsing -WebSession $gdsess -Headers @{
       "User-Agent"="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
@@ -133,7 +115,6 @@ function Invoke-GDriveDownload {
     return $DestinationPath
   }
 
-  # Try to parse confirm token from HTML body
   $html = $resp1.Content
   $confirmToken = $null
 
@@ -150,7 +131,6 @@ function Invoke-GDriveDownload {
     $url2 = "https://drive.google.com/uc?export=download&confirm=$confirmToken&id=$FileId"
   }
 
-  # Stage 2: final download
   Invoke-WebRequest -Uri $url2 -OutFile $DestinationPath -UseBasicParsing -WebSession $gdsess -Headers @{
     "User-Agent"="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
   } -ErrorAction Stop | Out-Null
@@ -189,7 +169,7 @@ function Get-FallbackKeyOrder {
 function Get-InitialLastFromSam {
   param([string]$Sam)
   if ([string]::IsNullOrWhiteSpace($Sam) -or $Sam.Length -lt 2) { return $null }
-  $s = ($Sam -replace "[^A-Za-z]","")  # letters only
+  $s = ($Sam -replace "[^A-Za-z]","")
   if ($s.Length -lt 2) { return $null }
   $initial = $s.Substring(0,1).ToUpper()
   $lastLower = $s.Substring(1).ToLower()
@@ -198,7 +178,8 @@ function Get-InitialLastFromSam {
 
 function New-RegexFromInitialLast {
   param([string]$Initial,[string]$LastLower,[switch]$ZipMode)
-  $tail = $ZipMode ? '\.zip$' : '\.(jpg|jpeg|png)$'
+  $tail = $null
+  if ($ZipMode) { $tail = '\.zip$' } else { $tail = '\.(jpg|jpeg|png)$' }
   return "^(?i)" + [regex]::Escape($Initial) + "[a-z]+" + [regex]::Escape($LastLower) + $tail
 }
 
@@ -235,7 +216,6 @@ function Find-ImageFromZip {
 
   $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
   try {
-    # --- 0) manual override filenames in outer zip ---
     if ($manual.Count -gt 0) {
       foreach ($e in $zip.Entries) {
         if ($e.Length -eq 0) { continue }
@@ -248,12 +228,11 @@ function Find-ImageFromZip {
       }
     }
 
-    # --- 1) direct match by filename in outer zip ---
     foreach ($key in $order) {
       $name = $Ctx.$key
       if ([string]::IsNullOrWhiteSpace($name)) { continue }
       foreach ($e in $zip.Entries) {
-        if ($e.Length -eq 0) { continue } # skip directories
+        if ($e.Length -eq 0) { continue }
         $base = [IO.Path]::GetFileNameWithoutExtension($e.Name)
         $ext  = [IO.Path]::GetExtension($e.Name)
         if ($exts -icontains $ext -and ($base -ieq $name -or $base -ieq $name.ToLower())) {
@@ -263,13 +242,12 @@ function Find-ImageFromZip {
       }
     }
 
-    # --- 2) fuzzy fallback from SAM -> FirstnameLastname.* ---
     $parts = Get-InitialLastFromSam -Sam $Ctx.SAM
     if ($parts) {
       $rx = New-RegexFromInitialLast -Initial $parts.Initial -LastLower $parts.LastLower
       foreach ($e in $zip.Entries) {
         if ($e.Length -eq 0) { continue }
-        $base = [IO.Path]::GetFileName($e.Name) # keep extension for regex
+        $base = [IO.Path]::GetFileName($e.Name)
         if ($base -match $rx) {
           $ext  = [IO.Path]::GetExtension($base)
           Write-Log "Fuzzy matched '$($e.FullName)' via '$rx'."
@@ -278,8 +256,6 @@ function Find-ImageFromZip {
       }
     }
 
-    # --- 3) inner per-user ZIPs ---
-    # 3a manual override inner zip names
     if ($manual.Count -gt 0) {
       foreach ($e in $zip.Entries) {
         if ($e.Length -eq 0) { continue }
@@ -293,7 +269,6 @@ function Find-ImageFromZip {
       }
     }
 
-    # 3b exact inner zip name by keys
     foreach ($key in $order) {
       $name = $Ctx.$key
       if ([string]::IsNullOrWhiteSpace($name)) { continue }
@@ -309,7 +284,6 @@ function Find-ImageFromZip {
       }
     }
 
-    # 3c fuzzy inner zip by SAM regex
     if ($parts) {
       $zrx = New-RegexFromInitialLast -Initial $parts.Initial -LastLower $parts.LastLower -ZipMode
       foreach ($e in $zip.Entries) {
@@ -346,7 +320,6 @@ function Find-ImageInsideInnerZip {
 
   $inner = New-Object System.IO.Compression.ZipArchive($ms,[System.IO.Compression.ZipArchiveMode]::Read,$false)
   try {
-    # manual override inside inner zip
     if ($Manual -and $Manual.Count -gt 0) {
       foreach ($e in $inner.Entries) {
         if ($e.Length -eq 0) { continue }
@@ -359,7 +332,6 @@ function Find-ImageInsideInnerZip {
       }
     }
 
-    # exact matches inside inner zip
     foreach ($key in $Order) {
       $name = $Ctx.$key
       if ([string]::IsNullOrWhiteSpace($name)) { continue }
@@ -374,7 +346,6 @@ function Find-ImageInsideInnerZip {
       }
     }
 
-    # fuzzy from SAM inside inner zip
     $parts = Get-InitialLastFromSam -Sam $Ctx.SAM
     if ($parts) {
       $rx = New-RegexFromInitialLast -Initial $parts.Initial -LastLower $parts.LastLower
@@ -439,7 +410,6 @@ try {
   $ctx = Get-UserContext
   Write-Log "User context -> UPN='$($ctx.UPN)', SAM='$($ctx.SAM)', DisplayName='$($ctx.DisplayName)', FirstLastCompact='$($ctx.FirstLastCompact)', FullCompact='$($ctx.FullCompact)'"
 
-  # 1) Download Drive file to temp
   $tempZip = Join-Path $env:TEMP ("sigpkg_" + [Guid]::NewGuid().ToString("N") + ".zip")
   Write-Log "Downloading signature package from Google Drive..."
   Invoke-GDriveDownload -FileId $GoogleDriveFileId -DestinationPath $tempZip | Out-Null
@@ -447,25 +417,21 @@ try {
   $size = (Get-Item $tempZip).Length
   Write-Log ("Downloaded: {0} ({1:N0} bytes)" -f $tempZip, $size)
 
-  # 2) Validate ZIP signature
   if (-not (Test-IsZipFile -Path $tempZip)) {
     throw "Downloaded file is not a ZIP (bad token). The Drive link may require auth or a new confirm token."
   }
 
-  # 3) Stream the correct image straight from the ZIP (or an inner per-user ZIP)
   $imgTemp = Find-ImageFromZip -ZipPath $tempZip -Ctx $ctx -PreferredPattern $ImagePattern
   if (-not $imgTemp) {
     throw "Could not locate an image for user using UPN/SAM/DisplayName/FirstLastCompact/FullCompact (.jpg/.jpeg/.png)."
   }
   Write-Log "Staged image: $imgTemp"
 
-  # 4) Ensure Outlook signature directory exists
   $sigFolder = Join-Path $env:APPDATA "Microsoft\Signatures"
   if (-not (Test-Path $sigFolder)) {
     New-Item -Path $sigFolder -ItemType Directory -Force | Out-Null
   }
 
-  # 5) Copy the image into Signatures and create signature HTML
   $targetImage = Join-Path $sigFolder ([IO.Path]::GetFileName($imgTemp))
   Copy-Item -LiteralPath $imgTemp -Destination $targetImage -Force
   Write-Log "Copied image to: $targetImage"
@@ -473,10 +439,8 @@ try {
   $htmlPath = New-HtmlSignature -SigFolder $sigFolder -SigBaseName $SignatureName -ImageFile $targetImage
   Write-Log "Created HTML signature: $htmlPath"
 
-  # 6) Set defaults
   Set-OutlookDefaultSignature -SigName $SignatureName
 
-  # 7) Optionally bounce Outlook
   if ($ForceKillOutlook) {
     $outlook = Get-Process OUTLOOK -ErrorAction SilentlyContinue
     if ($outlook) {
